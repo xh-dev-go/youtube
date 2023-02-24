@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 )
 
 // Downloader offers high level functions to download videos into files
@@ -176,10 +177,13 @@ func (dl *Downloader) videoDLWorker(ctx context.Context, out *os.File, video *yo
 	)
 
 	go func() {
+		var lastTime = time.Now()
 		for {
 			select {
 			case count := <-upateBytes:
 				bar.IncrInt64(count)
+				bar.DecoratorEwmaUpdate(time.Since(lastTime))
+				lastTime = time.Now()
 			case <-done:
 				break
 			}
