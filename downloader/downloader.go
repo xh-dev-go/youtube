@@ -3,15 +3,14 @@ package downloader
 import (
 	"context"
 	"fmt"
+	"github.com/kkdai/youtube/v2"
+	"github.com/vbauerster/mpb/v5"
+	"github.com/vbauerster/mpb/v5/decor"
 	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-
-	"github.com/kkdai/youtube/v2"
-	"github.com/vbauerster/mpb/v5"
-	"github.com/vbauerster/mpb/v5/decor"
 )
 
 // Downloader offers high level functions to download videos into files
@@ -149,7 +148,9 @@ func getVideoAudioFormats(v *youtube.Video, quality string, mimetype string) (*y
 }
 
 func (dl *Downloader) videoDLWorker(ctx context.Context, out *os.File, video *youtube.Video, format *youtube.Format) error {
-	stream, size, err := dl.GetStreamContext(ctx, video, format)
+	var upateBytes = make(chan int64)
+	var done = make(chan bool)
+	stream, size, err := dl.GetStreamContext1(ctx, video, format, upateBytes, done)
 	if err != nil {
 		return err
 	}
@@ -174,9 +175,21 @@ func (dl *Downloader) videoDLWorker(ctx context.Context, out *os.File, video *yo
 		),
 	)
 
-	reader := bar.ProxyReader(stream)
+	go func() {
+		for {
+			select {
+			case count := <-upateBytes:
+				bar.IncrInt64(count)
+			case <-done:
+				break
+			}
+		}
+	}()
+
+	//reader := bar.ProxyReader(stream)
 	mw := io.MultiWriter(out, prog)
-	_, err = io.Copy(mw, reader)
+	//_, err = io.Copy(mw, reader)
+	_, err = io.Copy(mw, stream)
 	if err != nil {
 		return err
 	}

@@ -1,6 +1,7 @@
 package youtube
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,7 +9,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"sort"
 	"strconv"
+	"sync"
 )
 
 // Client offers methods to download video metadata and video streams.
@@ -224,6 +228,38 @@ func (c *Client) GetStream(video *Video, format *Format) (io.ReadCloser, int64, 
 }
 
 // GetStreamContext returns the stream and the total size for a specific format with a context.
+func (c *Client) GetStreamContext1(ctx context.Context, video *Video, format *Format, byteUpdate chan int64, done chan bool) (io.ReadCloser, int64, error) {
+	url, err := c.GetStreamURL(video, format)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	r, w := io.Pipe()
+	contentLength := format.ContentLength
+
+	if contentLength == 0 {
+		// some videos don't have length information
+		contentLength = c.downloadOnce(req, w, format)
+	} else {
+		// we have length information, let's download by chunks!
+		go c.downloadChunked1(func() *http.Request {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
+				panic("failed to create request: " + err.Error())
+			}
+			return req
+		}, w, format, byteUpdate, video.ID, done)
+	}
+
+	return r, contentLength, nil
+}
+
+// GetStreamContext returns the stream and the total size for a specific format with a context.
 func (c *Client) GetStreamContext(ctx context.Context, video *Video, format *Format) (io.ReadCloser, int64, error) {
 	url, err := c.GetStreamURL(video, format)
 	if err != nil {
@@ -274,6 +310,110 @@ func (c *Client) downloadOnce(req *http.Request, w *io.PipeWriter, format *Forma
 	return len
 }
 
+type Pair struct {
+	Byte  int64
+	Err   error
+	Index int
+}
+
+type PassThru struct {
+	io.Reader
+	total     int64 // Total # of bytes transferred
+	bytesChan chan int64
+}
+
+func (pt *PassThru) Read(p []byte) (int, error) {
+	n, err := pt.Reader.Read(p)
+	b := int64(n)
+	pt.bytesChan <- b
+	pt.total += b
+
+	//if err == nil {
+	//	fmt.Println("Read", n, "bytes for a total of", pt.total)
+	//}
+
+	return n, err
+}
+
+func (c *Client) downloadChunked1(reqFunc func() *http.Request, w *io.PipeWriter, format *Format, byteUpdate chan int64,
+	filename string, done chan bool,
+) {
+	const chunkSize int64 = 5_000_000
+	// Loads a chunk a returns the written bytes.
+	// Downloading in multiple chunks is much faster:
+	// https://github.com/kkdai/youtube/pull/190
+	var wg sync.WaitGroup
+	var pairs = make([]Pair, 0)
+
+	loadChunk := func(pos int64, index int) {
+		req := reqFunc()
+		req.Header.Set("Range", fmt.Sprintf("bytes=%v-%v", pos, pos+chunkSize-1))
+
+		resp, err := c.httpDo(req)
+		if err != nil {
+			pairs = append(pairs, Pair{Byte: 0, Err: err, Index: index})
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusPartialContent {
+			pairs = append(pairs, Pair{0, ErrUnexpectedStatusCode(resp.StatusCode), index})
+			return
+		}
+		f, err := os.Create(filename + ".temp_" + strconv.Itoa(index))
+		if err != nil {
+			pairs = append(pairs, Pair{Byte: 0, Err: err, Index: index})
+			return
+		}
+		defer f.Close()
+		writer := bufio.NewWriter(f)
+		p := PassThru{bytesChan: byteUpdate, Reader: resp.Body}
+
+		count, err := io.Copy(writer, &p)
+		pairs = append(pairs, Pair{Byte: count, Err: err, Index: index})
+		log.Println("Done item: ", index, "")
+		wg.Done()
+	}
+
+	defer w.Close()
+
+	//nolint:revive,errcheck
+	// load all the chunks
+	var index = 0
+	for pos := int64(0); pos < format.ContentLength; {
+		wg.Add(1)
+		go loadChunk(pos, index)
+		pos += chunkSize
+		index += 1
+	}
+	wg.Wait()
+	fmt.Println("Start merge file")
+
+	sort.Slice(pairs, func(i, j int) bool {
+		return pairs[i].Index < pairs[j].Index
+	})
+	for _, pairs := range pairs {
+		if pairs.Err != nil {
+			panic("error in downloadChunked1")
+		}
+
+		f, err := os.Open(filename + ".temp_" + strconv.Itoa(pairs.Index))
+		if err != nil {
+			panic("error in downloadChunked1")
+		}
+		_, err = io.Copy(w, bufio.NewReader(f))
+		if err != nil {
+			panic("error in copy bytes")
+		}
+		f.Close()
+		err = os.Remove(f.Name())
+		if err != nil {
+			log.Println(err.Error())
+			log.Println("error in remove file")
+		}
+	}
+	done <- true
+}
 func (c *Client) downloadChunked(req *http.Request, w *io.PipeWriter, format *Format) {
 	const chunkSize int64 = 10_000_000
 	// Loads a chunk a returns the written bytes.
